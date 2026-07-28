@@ -1102,7 +1102,7 @@ class ExpiryRangeCompressionBot:
             )
 
             returns = self.history.log_returns()
-            candidates = self.mc_engine.search_grid(spot=price, historical_returns=returns)
+            candidates = self.mc_engine.search_grid(s0=price, historical_returns=returns)
             self.last_candidates = candidates
 
             decision = await select_trade(self.deriv, candidates, spot=price)
