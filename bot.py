@@ -44,7 +44,9 @@ import json
 import time
 import math
 import logging
-from dataclasses import dataclass, field
+import logging.handlers
+import datetime
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Tuple, Dict, Any
 from collections import deque
 
@@ -78,11 +80,53 @@ try:
 except ImportError:
     SUPABASE_AVAILABLE = False
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+LOG_DIR = os.environ.get("LOG_DIR", "logs")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def _make_rotating_handler(filename: str, level, fmt: str) -> logging.Handler:
+    handler = logging.handlers.RotatingFileHandler(
+        os.path.join(LOG_DIR, filename), maxBytes=10 * 1024 * 1024, backupCount=5,
+    )
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(fmt))
+    return handler
+
+
+# -- operational/system logger --------------------------------------------
+# Connection state, heartbeat summaries, warnings, errors, one-line
+# "what happened" events. Tail this for "is the bot alive and doing the
+# right thing right now".
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(LOG_LEVEL)
+_console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+
 log = logging.getLogger("expiryrange_compression_bot")
+log.setLevel(LOG_LEVEL)
+log.addHandler(_console_handler)
+log.addHandler(_make_rotating_handler("bot.log", LOG_LEVEL, "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+log.propagate = False
+
+# -- decision-audit logger -------------------------------------------------
+# Every time the regime layer fires a Compression read and the Monte Carlo
+# grid runs, this writes one full audit block: the regime reading, every
+# MC candidate's parametric/bootstrap/blended probabilities, the payout-gate
+# and EV-gate outcome for each candidate, and the final decision -- whether
+# or not a trade was actually taken. Read this to understand *why* a
+# specific trade fired (or didn't).
+#
+# NOTE (Railway): local disk is ephemeral across redeploys/restarts, so
+# treat these files as a rolling local convenience buffer, not permanent
+# storage -- the Supabase trade rows remain the durable record.
+trade_log = logging.getLogger("trade_signals")
+trade_log.setLevel(logging.INFO)
+_trade_console = logging.StreamHandler()
+_trade_console.setLevel(logging.INFO)
+_trade_console.setFormatter(logging.Formatter("%(message)s"))
+trade_log.addHandler(_trade_console)
+trade_log.addHandler(_make_rotating_handler("trades.log", logging.INFO, "%(message)s"))
+trade_log.propagate = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -134,6 +178,7 @@ COMPRESSION_BBW_PERCENTILE = float(os.environ.get("COMPRESSION_BBW_PERCENTILE", 
 COMPRESSION_ADX_MAX = float(os.environ.get("COMPRESSION_ADX_MAX", "20"))
 COMPRESSION_HURST_MAX = float(os.environ.get("COMPRESSION_HURST_MAX", "0.48"))
 REGIME_LOOKBACK = int(os.environ.get("REGIME_LOOKBACK", "300"))
+HEARTBEAT_INTERVAL_SEC = int(os.environ.get("HEARTBEAT_INTERVAL_SEC", "60"))
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +384,23 @@ class MonteCarloEngine:
         self._garch_fitted = None
         self._last_fit_time = 0.0
         self._fallback_sigma = None
+
+    def fit_summary(self) -> Dict[str, Any]:
+        """Snapshot of current model state, for heartbeat/diagnostic logging."""
+        summary: Dict[str, Any] = {
+            "last_fit_time": self._last_fit_time,
+            "seconds_since_fit": (time.time() - self._last_fit_time) if self._last_fit_time else None,
+            "hmm_fitted": self._hmm is not None,
+            "garch_fitted": self._garch_fitted is not None,
+            "fallback_sigma": self._fallback_sigma,
+        }
+        if self._hmm is not None:
+            means = self._hmm.means_.flatten().tolist()
+            covars = self._hmm.covars_.reshape(self.hmm_states, -1)[:, 0]
+            sigmas = np.sqrt(np.clip(covars, 1e-12, None)).tolist()
+            summary["hmm_state_means"] = means
+            summary["hmm_state_sigmas"] = sigmas
+        return summary
 
     # -- fitting -----------------------------------------------------------
 
@@ -785,6 +847,10 @@ class TradeDecision:
     proposal_id: Optional[str] = None
     ask_price: Optional[float] = None
     reason: str = ""
+    # Per-candidate audit trail: what each candidate's proposal/payout gate
+    # and EV gate said, in the order candidates were evaluated. Populated
+    # by select_trade() and consumed by the trade_log signal audit.
+    diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
 
 async def select_trade(
@@ -803,7 +869,16 @@ async def select_trade(
     at your stake, not that the bot is broken.
     """
     scored = []
+    diagnostics: List[Dict[str, Any]] = []
+
     for c in candidates:
+        entry: Dict[str, Any] = {
+            "duration_min": c.duration_min,
+            "barrier_half_width_pct": c.barrier_half_width_pct,
+            "p_stay_parametric": c.p_stay_parametric,
+            "p_stay_bootstrap": c.p_stay_bootstrap,
+            "p_stay_blended": c.p_stay_blended,
+        }
         barrier_abs = spot * (c.barrier_half_width_pct / 100.0)
         try:
             proposal = await deriv.get_proposal(
@@ -814,6 +889,8 @@ async def select_trade(
             )
         except Exception as exc:
             log.warning("Proposal request failed for %s/%s: %s", c.duration_min, c.barrier_half_width_pct, exc)
+            entry.update({"gate": "proposal_failed", "detail": str(exc)})
+            diagnostics.append(entry)
             continue
 
         prop = proposal.get("proposal", {})
@@ -821,21 +898,38 @@ async def select_trade(
         ask_price = prop.get("ask_price", stake)
         proposal_id = prop.get("id")
         if payout is None or ask_price is None:
+            entry.update({"gate": "proposal_incomplete", "detail": "missing payout/ask_price in proposal response"})
+            diagnostics.append(entry)
             continue
 
         payout_pct = (payout - ask_price) / ask_price * 100.0
+        entry["payout_pct"] = payout_pct
         if payout_pct < min_payout_pct:
+            entry.update({"gate": "payout_gate_fail",
+                          "detail": f"payout_pct {payout_pct:.2f}% < min {min_payout_pct:.2f}%"})
+            diagnostics.append(entry)
             continue
 
         implied_breakeven_p = ask_price / payout  # probability needed to break even
         ev = c.p_stay_blended * payout - (1 - c.p_stay_blended) * ask_price
+        entry["breakeven_p"] = implied_breakeven_p
+        entry["ev"] = ev
         if c.p_stay_blended <= implied_breakeven_p:
+            entry.update({"gate": "ev_gate_fail",
+                          "detail": f"p_stay_blended {c.p_stay_blended:.3f} <= breakeven {implied_breakeven_p:.3f}"})
+            diagnostics.append(entry)
             continue  # payout clears the threshold but model doesn't think it's a real edge
 
+        entry["gate"] = "passed"
+        diagnostics.append(entry)
         scored.append((ev, c, payout_pct, proposal_id, ask_price))
 
     if not scored:
-        return TradeDecision(should_trade=False, reason="No candidate cleared both the payout gate and the EV gate.")
+        return TradeDecision(
+            should_trade=False,
+            reason="No candidate cleared both the payout gate and the EV gate.",
+            diagnostics=diagnostics,
+        )
 
     scored.sort(key=lambda x: x[0], reverse=True)
     ev, best, payout_pct, proposal_id, ask_price = scored[0]
@@ -850,6 +944,7 @@ async def select_trade(
         proposal_id=proposal_id,
         ask_price=ask_price,
         reason="cleared payout gate and EV gate",
+        diagnostics=diagnostics,
     )
 
 
@@ -867,11 +962,86 @@ class ExpiryRangeCompressionBot:
       5. If something clears both gates: buy, log, cooldown
       6. If nothing clears: log the miss and keep streaming (normal, expected)
 
+    A separate heartbeat task (see heartbeat_loop) logs a status summary
+    every HEARTBEAT_INTERVAL_SEC seconds regardless of whether a Compression
+    regime has fired -- tick buffer progress, current model fit state,
+    what the regime layer currently sees, a lightweight MC read at a
+    representative duration/barrier, and a running trade/gate tally -- so
+    you have visibility into what's happening between trades, not just at
+    trade time.
+
     Runs LIVE against real money by default -- STAKE_AMOUNT is intentionally
     small (default $1) per the explicit choice to go live rather than
     shadow-trade first. Raise STAKE_AMOUNT only after you've watched enough
     real trade logs to trust the gate behavior.
     """
+
+    # Representative candidate used only for the heartbeat's quick MC read --
+    # not part of the actual trading grid/decision.
+    HEARTBEAT_DURATION_MIN = 10
+    HEARTBEAT_BARRIER_HW_PCT = 0.5
+
+    @staticmethod
+    def _write_signal_audit(
+        epoch: float,
+        price: float,
+        regime: RegimeReading,
+        candidates: List[MCCandidate],
+        decision: TradeDecision,
+    ) -> None:
+        """
+        Writes one complete audit block to trade_log for a single evaluated
+        signal (a Compression read that triggered the MC grid) -- covering
+        every intelligence layer in the decision hierarchy:
+
+          1. Regime layer      -- the reading that triggered evaluation
+          2. Monte Carlo layer -- every (duration, barrier) candidate's
+                                  parametric / bootstrap / blended p_stay
+          3. Gate layer        -- per-candidate payout-gate + EV-gate result
+          4. Final decision    -- what was (or wasn't) traded, and why
+
+        Called for every signal that reaches the grid, whether or not a
+        trade is ultimately taken, so misses are just as auditable as fills.
+        """
+        ts_iso = datetime.datetime.utcfromtimestamp(epoch).isoformat() + "Z"
+        lines = [
+            "=" * 78,
+            f"SIGNAL  ts={ts_iso}  epoch={epoch:.0f}  symbol={SYMBOL}  spot={price}",
+            "-" * 78,
+            "[1] REGIME LAYER",
+            (f"    label={regime.label}  realized_vol={regime.realized_vol:.6f}  "
+             f"bbw={regime.bbw:.4f}  adx={regime.adx:.2f}  hurst={regime.hurst:.3f}"),
+            (f"    vol_percentile={regime.detail.get('vol_percentile', float('nan')):.1f}  "
+             f"bbw_percentile={regime.detail.get('bbw_percentile', float('nan')):.1f}"),
+            f"[2] MONTE CARLO LAYER  ({len(candidates)} candidates)",
+        ]
+        for c in candidates:
+            lines.append(
+                f"    duration={c.duration_min:>2}min  barrier_hw={c.barrier_half_width_pct:>4.2f}%  "
+                f"p_stay: parametric={c.p_stay_parametric:.3f}  bootstrap={c.p_stay_bootstrap:.3f}  "
+                f"blended={c.p_stay_blended:.3f}"
+            )
+        lines.append("[3] GATE LAYER (payout gate + EV gate, per candidate)")
+        for d in decision.diagnostics:
+            gate = d.get("gate", "unknown")
+            base = f"    duration={d['duration_min']:>2}min barrier_hw={d['barrier_half_width_pct']:>4.2f}%  -> {gate}"
+            if gate == "passed":
+                base += (f"  payout_pct={d.get('payout_pct', float('nan')):.2f}%  "
+                         f"breakeven_p={d.get('breakeven_p', float('nan')):.3f}  ev={d.get('ev', float('nan')):.4f}")
+            elif "detail" in d:
+                base += f"  ({d['detail']})"
+            lines.append(base)
+        lines.append("[4] FINAL DECISION")
+        if decision.should_trade:
+            lines.append(
+                f"    TRADE TAKEN  duration={decision.duration_min}min  "
+                f"barrier_hw={decision.barrier_half_width_pct}%  payout={decision.payout_pct:.2f}%  "
+                f"p_stay={decision.p_stay:.3f}  ev={decision.ev:.4f}"
+            )
+        else:
+            lines.append(f"    NO TRADE  -- {decision.reason}")
+        lines.append("=" * 78)
+        trade_log.info("\n".join(lines))
 
     def __init__(self):
         self.deriv = DerivClient()
@@ -882,15 +1052,37 @@ class ExpiryRangeCompressionBot:
         self.open_trades = 0
         self._last_trade_time = 0.0
 
+        # state surfaced by the heartbeat logger
+        self.last_regime: Optional[RegimeReading] = None
+        self.last_candidates: List[MCCandidate] = []
+        self.last_decision: Optional[TradeDecision] = None
+        self.last_price: Optional[float] = None
+        self.last_epoch: Optional[float] = None
+        self.trade_count = 0
+        self.miss_count = 0
+        self.compression_count = 0
+
     async def run(self) -> None:
         await self.deriv.connect()
         log.info("Connected to Deriv. Streaming %s ticks...", SYMBOL)
 
+        heartbeat_task = asyncio.create_task(self.heartbeat_loop())
+        try:
+            await self._consume_ticks()
+        finally:
+            heartbeat_task.cancel()
+
+    async def _consume_ticks(self) -> None:
         async for price, epoch in self.deriv.subscribe_ticks(SYMBOL):
             self.history.add(price, epoch)
+            self.last_price = price
+            self.last_epoch = epoch
 
             if len(self.history) < MIN_TICKS_BEFORE_TRADING:
                 continue
+
+            regime = self.regime_detector.read(self.history)
+            self.last_regime = regime
 
             if self.open_trades >= MAX_CONCURRENT_TRADES:
                 continue
@@ -898,10 +1090,10 @@ class ExpiryRangeCompressionBot:
             if (time.time() - self._last_trade_time) < COOLDOWN_SEC_AFTER_TRADE:
                 continue
 
-            regime = self.regime_detector.read(self.history)
             if regime.label != "Compression":
                 continue
 
+            self.compression_count += 1
             log.info(
                 "Compression regime detected (vol_pct=%.1f bbw_pct=%.1f adx=%.2f hurst=%.3f) -- running Monte Carlo grid",
                 regime.detail.get("vol_percentile", float("nan")),
@@ -911,8 +1103,16 @@ class ExpiryRangeCompressionBot:
 
             returns = self.history.log_returns()
             candidates = self.mc_engine.search_grid(spot=price, historical_returns=returns)
+            self.last_candidates = candidates
 
             decision = await select_trade(self.deriv, candidates, spot=price)
+            self.last_decision = decision
+
+            # Full intelligence-layer audit (regime + every MC candidate +
+            # every gate outcome + final decision) goes to trade_log, not
+            # the operational log -- keeps `log` readable at a glance while
+            # trades.log carries the complete "why" for every signal.
+            self._write_signal_audit(epoch, price, regime, candidates, decision)
 
             base_log_row = {
                 "ts": epoch,
@@ -927,6 +1127,7 @@ class ExpiryRangeCompressionBot:
             }
 
             if not decision.should_trade:
+                self.miss_count += 1
                 base_log_row.update({"gate_passed": False, "reason": decision.reason})
                 self.logger.log_trade(base_log_row)
                 continue
@@ -935,12 +1136,19 @@ class ExpiryRangeCompressionBot:
                 buy_result = await self.deriv.buy(decision.proposal_id, decision.ask_price)
             except Exception as exc:
                 log.exception("Buy failed: %s", exc)
+                trade_log.info("BUY FAILED for signal above -- %s", exc)
                 base_log_row.update({"gate_passed": True, "reason": f"buy_failed: {exc}"})
                 self.logger.log_trade(base_log_row)
                 continue
 
             self.open_trades += 1
+            self.trade_count += 1
             self._last_trade_time = time.time()
+            # NOTE: this bot does not currently track contract expiry to
+            # decrement open_trades / free up the cooldown slot -- wire up
+            # a proposal_open_contract subscription on buy_result's
+            # contract_id if you want the loop to reset automatically
+            # rather than relying on MAX_CONCURRENT_TRADES=1 + cooldown.
 
             base_log_row.update({
                 "gate_passed": True,
@@ -959,12 +1167,92 @@ class ExpiryRangeCompressionBot:
                 decision.duration_min, decision.barrier_half_width_pct,
                 decision.payout_pct, decision.p_stay, decision.ev,
             )
+            trade_log.info(
+                "FILLED contract_id=%s buy_price=%s (for signal audited above)",
+                buy_result.get("buy", {}).get("contract_id"),
+                buy_result.get("buy", {}).get("buy_price"),
+            )
 
-            # NOTE: this bot does not currently track contract expiry to
-            # decrement open_trades / free up the cooldown slot -- wire up
-            # a proposal_open_contract subscription on buy_result's
-            # contract_id if you want the loop to reset automatically
-            # rather than relying on MAX_CONCURRENT_TRADES=1 + cooldown.
+    async def heartbeat_loop(self) -> None:
+        """Logs a status summary every HEARTBEAT_INTERVAL_SEC seconds,
+        independent of whether a Compression regime has fired. Never raises
+        -- a heartbeat failure (e.g. a transient MC estimate error) is logged
+        and skipped rather than killing the main tick-consumption loop."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+            try:
+                self._log_heartbeat()
+            except Exception:
+                log.exception("Heartbeat logging failed (non-fatal, continuing)")
+
+    def _log_heartbeat(self) -> None:
+        n_ticks = len(self.history)
+        warm = n_ticks >= MIN_TICKS_BEFORE_TRADING
+
+        log.info(
+            "HEARTBEAT | ticks=%d/%d (%s) | last_price=%s | trades=%d misses=%d compression_reads=%d",
+            n_ticks, MIN_TICKS_BEFORE_TRADING, "warm" if warm else "warming up",
+            self.last_price, self.trade_count, self.miss_count, self.compression_count,
+        )
+
+        if not warm:
+            return  # nothing else meaningful to report yet
+
+        # -- model fit layer --
+        fit = self.mc_engine.fit_summary()
+        if fit["hmm_fitted"]:
+            sigmas = ", ".join(f"{s:.6f}" for s in fit["hmm_state_sigmas"])
+            log.info(
+                "  MODEL FIT | hmm_states_sigma=[%s] garch_fitted=%s last_fit=%.0fs ago",
+                sigmas, fit["garch_fitted"],
+                fit["seconds_since_fit"] if fit["seconds_since_fit"] is not None else -1,
+            )
+        else:
+            log.info("  MODEL FIT | not yet fitted (needs >=200 returns; refits every %ss)", REFIT_INTERVAL_SEC)
+
+        # -- regime layer --
+        r = self.last_regime
+        if r is not None:
+            log.info(
+                "  REGIME | label=%s realized_vol=%.6f bbw=%.4f adx=%.2f hurst=%.3f vol_pct=%.1f bbw_pct=%.1f",
+                r.label, r.realized_vol, r.bbw, r.adx, r.hurst,
+                r.detail.get("vol_percentile", float("nan")), r.detail.get("bbw_percentile", float("nan")),
+            )
+
+        # -- MC layer: lightweight read at a representative candidate, purely
+        # diagnostic (not part of the trading grid/decision) --
+        if self.last_price is not None and n_ticks >= 200:
+            returns = self.history.log_returns()
+            self.mc_engine.maybe_refit(returns)  # no-op if within REFIT_INTERVAL_SEC
+            quick = self.mc_engine.estimate_stay_probability(
+                s0=self.last_price,
+                duration_min=self.HEARTBEAT_DURATION_MIN,
+                barrier_half_width_pct=self.HEARTBEAT_BARRIER_HW_PCT,
+                historical_returns=returns,
+            )
+            log.info(
+                "  MC READ (diagnostic, %smin/%.2f%% barrier) | parametric=%.3f bootstrap=%.3f blended=%.3f",
+                self.HEARTBEAT_DURATION_MIN, self.HEARTBEAT_BARRIER_HW_PCT,
+                quick.p_stay_parametric, quick.p_stay_bootstrap, quick.p_stay_blended,
+            )
+
+        # -- last real trading-grid candidates + gate decision, if any --
+        if self.last_candidates:
+            for c in self.last_candidates:
+                log.info(
+                    "  LAST GRID | duration=%smin barrier_hw=%.2f%% p_stay(parametric=%.3f bootstrap=%.3f blended=%.3f)",
+                    c.duration_min, c.barrier_half_width_pct,
+                    c.p_stay_parametric, c.p_stay_bootstrap, c.p_stay_blended,
+                )
+        if self.last_decision is not None:
+            d = self.last_decision
+            if d.should_trade:
+                log.info(
+                    "  LAST GATE RESULT | TRADED duration=%smin barrier_hw=%.2f%% payout=%.1f%% p_stay=%.3f ev=%.4f",
+                    d.duration_min, d.barrier_half_width_pct, d.payout_pct, d.p_stay, d.ev,
+                )
+            else:
+                log.info("  LAST GATE RESULT | no trade -- %s", d.reason)
 
 
 def main() -> None:
