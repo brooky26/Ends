@@ -174,7 +174,18 @@ DURATION_CANDIDATES_MIN = [5, 10, 15, 20, 30]
 # few percent payout, well under MIN_PAYOUT_PCT. Barrier width now
 # scales with the *measured* volatility of the horizon instead of a
 # static percent -- see BARRIER_SIGMA_MULTIPLIERS / search_grid below.
-BARRIER_SIGMA_MULTIPLIERS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
+#
+# Widened from the initial [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]: live logs
+# after the first fix showed Deriv's payout curve is steep right
+# around 0.5-1.0 sigma -- payout jumped from ~78% (0.5 sigma, but
+# p_stay too low to clear the EV gate) straight down to 43% then 13%
+# then 3% at the next few coarse steps, skipping over the region
+# where payout and p_stay might both clear their gates at once. Finer
+# steps through that zone (0.6-1.1 sigma) give the gate logic more
+# chances to find a candidate where both actually line up, without
+# changing what "sigma" means or touching the gate thresholds
+# themselves.
+BARRIER_SIGMA_MULTIPLIERS = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0]
 
 # Data windows
 PRICE_HISTORY_LEN = int(os.environ.get("PRICE_HISTORY_LEN", "3000"))
