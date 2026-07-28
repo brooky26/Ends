@@ -784,7 +784,7 @@ class DerivClient:
             "currency": "USD",
             "duration": duration_min,
             "duration_unit": "m",
-            "symbol": symbol,
+            "underlying_symbol": symbol,
             "barrier": f"+{barrier_high}",
             "barrier2": f"-{barrier_low}",
         }
