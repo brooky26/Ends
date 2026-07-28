@@ -1,5 +1,6 @@
 numpy>=1.24
 websockets>=12.0
+aiohttp>=3.9
 hmmlearn>=0.3.0
 arch>=6.3.0
 supabase>=2.4.0

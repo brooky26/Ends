@@ -56,6 +56,11 @@ except ImportError:
     websockets = None
 
 try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+
+try:
     from hmmlearn.hmm import GaussianHMM
     HMM_AVAILABLE = True
 except ImportError:
@@ -87,7 +92,13 @@ SYMBOL = "1HZ10V"
 
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN")
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+
+# Current Options API (REST + OTP-authenticated WebSocket) -- replaces the
+# old ws.derivws.com/websockets/v3?app_id=... model, which now rejects the
+# handshake with HTTP 401 rather than letting you authorize in-band.
+DERIV_WS_PUBLIC_URL = "wss://api.derivws.com/trading/v1/options/ws/public"
+DERIV_ACCOUNT_TYPE = os.environ.get("DERIV_ACCOUNT_TYPE", "real")  # "demo" or "real"
+DERIV_ACCOUNT_ID = os.environ.get("DERIV_ACCOUNT_ID")  # optional -- skips the accounts lookup if set
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -551,62 +562,157 @@ class MonteCarloEngine:
 
 class DerivClient:
     """
-    Thin async wrapper over Deriv's WebSocket API (v3). Swap this class
-    out if you've since moved to the REST OTP Options API used in the
-    institutional research platform -- the rest of the bot only depends
-    on the method signatures below (connect, authorize, subscribe_ticks,
-    get_proposal, buy).
+    Async client for Deriv's current Options API (REST + OTP-authenticated
+    WebSocket), replacing the old app_id-only ws.derivws.com/websockets/v3
+    connection model -- that old model now rejects the handshake outright
+    (HTTP 401) rather than letting you authorize in-band after connecting.
+
+    Two separate connections are used:
+      - a PUBLIC websocket (no auth) for the tick stream --
+        wss://api.derivws.com/trading/v1/options/ws/public
+      - an OTP-AUTHENTICATED websocket for trading calls (proposal, buy) --
+        obtained by POSTing /trading/v1/options/accounts/{account_id}/otp
+        (Deriv-App-ID header + Authorization: Bearer token), which returns
+        a ready-to-use ws URL with the OTP embedded. The OTP itself is only
+        valid for ~120s, so it's requested fresh each time the trade
+        connection needs to be (re)established, not reused across drops.
+
+    The proposal/buy message schema on the authenticated socket is
+    unchanged from the legacy API (same JSON-RPC style {"proposal": 1, ...}
+    / {"buy": ..., "price": ...} payloads) -- only the connection setup
+    changed. If Deriv has since changed that schema too, adjust
+    get_proposal()/buy() accordingly; everything else in the bot is
+    decoupled from this class via its method signatures.
     """
 
-    def __init__(self, app_id: str = DERIV_APP_ID, token: Optional[str] = DERIV_API_TOKEN):
+    REST_BASE = "https://api.derivws.com/trading/v1/options"
+
+    def __init__(
+        self,
+        app_id: str = DERIV_APP_ID,
+        token: Optional[str] = DERIV_API_TOKEN,
+        account_type: str = DERIV_ACCOUNT_TYPE,
+        account_id: Optional[str] = DERIV_ACCOUNT_ID,
+    ):
         self.app_id = app_id
         self.token = token
-        self.ws = None
+        self.account_type = account_type  # "demo" or "real"
+        self.account_id = account_id
+        self.public_ws = None
+        self.trade_ws = None
         self._req_id = 0
+        self._http = None  # aiohttp session, created lazily
+
+    async def _get_http(self):
+        if aiohttp is None:
+            raise RuntimeError("`aiohttp` package not installed -- pip install aiohttp")
+        if self._http is None:
+            self._http = aiohttp.ClientSession()
+        return self._http
+
+    # -- setup ---------------------------------------------------------------
 
     async def connect(self) -> None:
+        """Open the public tick-stream socket and the authenticated trade socket."""
         if websockets is None:
             raise RuntimeError("`websockets` package not installed -- pip install websockets")
-        self.ws = await websockets.connect(DERIV_WS_URL, ping_interval=20, ping_timeout=10)
+        self.public_ws = await websockets.connect(DERIV_WS_PUBLIC_URL, ping_interval=20, ping_timeout=10)
         if self.token:
-            await self.authorize()
+            await self._connect_trade_ws()
+        else:
+            log.warning("DERIV_API_TOKEN not set -- trading calls (proposal/buy) will fail. "
+                        "Only the public tick stream will work.")
 
-    async def _send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def _resolve_account_id(self) -> str:
+        if self.account_id:
+            return self.account_id
+        http = await self._get_http()
+        headers = {"Deriv-App-ID": self.app_id, "Authorization": f"Bearer {self.token}"}
+        async with http.get(f"{self.REST_BASE}/accounts", headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"Failed to list Deriv accounts ({resp.status}): {text}")
+            body = await resp.json()
+        accounts = body.get("data", [])
+        if isinstance(accounts, dict):
+            accounts = [accounts]
+        match = next((a for a in accounts if a.get("account_type") == self.account_type), None)
+        if match is None and accounts:
+            match = accounts[0]
+        if match is None:
+            raise RuntimeError(
+                f"No Deriv account found for account_type={self.account_type!r}. "
+                f"Set DERIV_ACCOUNT_ID explicitly to skip this lookup."
+            )
+        self.account_id = match["account_id"]
+        return self.account_id
+
+    async def _request_otp_ws_url(self) -> str:
+        account_id = await self._resolve_account_id()
+        http = await self._get_http()
+        headers = {"Deriv-App-ID": self.app_id, "Authorization": f"Bearer {self.token}"}
+        async with http.post(f"{self.REST_BASE}/accounts/{account_id}/otp", headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"OTP request failed ({resp.status}): {text}")
+            body = await resp.json()
+        url = body["data"]["url"]
+        return url
+
+    async def _connect_trade_ws(self) -> None:
+        """(Re)establish the authenticated trading socket via a fresh OTP.
+        OTPs expire in ~120s, so this is called right before the socket is
+        needed, not held onto and reused across a long-lived connection."""
+        ws_url = await self._request_otp_ws_url()
+        if self.trade_ws is not None:
+            try:
+                await self.trade_ws.close()
+            except Exception:
+                pass
+        self.trade_ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10)
+
+    async def _ensure_trade_ws(self) -> None:
+        if self.trade_ws is None or self.trade_ws.close_code is not None:
+            await self._connect_trade_ws()
+
+    async def _send_trade(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        await self._ensure_trade_ws()
         self._req_id += 1
         payload = {**payload, "req_id": self._req_id}
-        await self.ws.send(json.dumps(payload))
+        await self.trade_ws.send(json.dumps(payload))
         while True:
-            raw = await self.ws.recv()
+            raw = await self.trade_ws.recv()
             msg = json.loads(raw)
             if msg.get("req_id") == self._req_id:
                 if "error" in msg:
                     raise RuntimeError(f"Deriv API error: {msg['error']}")
                 return msg
 
-    async def authorize(self) -> Dict[str, Any]:
-        return await self._send({"authorize": self.token})
+    # -- market data -----------------------------------------------------------
 
     async def subscribe_ticks(self, symbol: str = SYMBOL):
-        """Async generator yielding (price, epoch) tuples."""
+        """Async generator yielding (price, epoch) tuples from the public socket."""
         self._req_id += 1
-        await self.ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": self._req_id}))
+        await self.public_ws.send(json.dumps({"ticks": symbol, "subscribe": 1, "req_id": self._req_id}))
         while True:
-            raw = await self.ws.recv()
+            raw = await self.public_ws.recv()
             msg = json.loads(raw)
             if msg.get("msg_type") == "tick":
                 tick = msg["tick"]
                 yield float(tick["quote"]), float(tick["epoch"])
+
+    # -- trading -----------------------------------------------------------
 
     async def get_proposal(
         self, duration_min: int, barrier_high: float, barrier_low: float,
         stake: float = STAKE_AMOUNT, symbol: str = SYMBOL,
     ) -> Dict[str, Any]:
         """
-        EXPIRYRANGE ("Ends Between") proposal. barrier/barrier2 must be
-        passed as relative offsets or absolute prices per Deriv's current
-        contract spec -- confirm the exact format against the live API
-        docs/playground before going live, since Deriv has changed barrier
-        formatting conventions across contract types before.
+        EXPIRYRANGE ("Ends Between") proposal. barrier/barrier2 format is
+        carried over unchanged from the legacy API -- confirm against the
+        current docs/playground before trusting it at higher stakes, since
+        this specific field's format wasn't part of what changed in the
+        REST+OTP migration but could still shift independently.
         """
         payload = {
             "proposal": 1,
@@ -620,14 +726,18 @@ class DerivClient:
             "barrier": f"+{barrier_high}",
             "barrier2": f"-{barrier_low}",
         }
-        return await self._send(payload)
+        return await self._send_trade(payload)
 
     async def buy(self, proposal_id: str, price: float) -> Dict[str, Any]:
-        return await self._send({"buy": proposal_id, "price": price})
+        return await self._send_trade({"buy": proposal_id, "price": price})
 
     async def close(self) -> None:
-        if self.ws is not None:
-            await self.ws.close()
+        if self.public_ws is not None:
+            await self.public_ws.close()
+        if self.trade_ws is not None:
+            await self.trade_ws.close()
+        if self._http is not None:
+            await self._http.close()
 
 
 # ---------------------------------------------------------------------------
