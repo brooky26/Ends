@@ -149,12 +149,12 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Trading params -- small stake per explicit choice to go live directly
 STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "1.0"))
-MIN_PAYOUT_PCT = float(os.environ.get("MIN_PAYOUT_PCT", "52.0"))  # gate, not a guarantee
+MIN_PAYOUT_PCT = float(os.environ.get("MIN_PAYOUT_PCT", "40.0"))  # gate, not a guarantee
 MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", "1"))
 COOLDOWN_SEC_AFTER_TRADE = int(os.environ.get("COOLDOWN_SEC_AFTER_TRADE", "30"))
 
 # Monte Carlo params
-MC_PATHS = int(os.environ.get("MC_PATHS", "5000"))
+MC_PATHS = int(os.environ.get("MC_PATHS", "50000"))
 HMM_N_STATES = int(os.environ.get("HMM_N_STATES", "3"))
 JUMP_INTENSITY_PER_DAY = float(os.environ.get("JUMP_INTENSITY_PER_DAY", "2.0"))
 JUMP_MEAN = float(os.environ.get("JUMP_MEAN", "0.0"))
