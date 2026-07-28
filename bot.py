@@ -163,7 +163,18 @@ TICKS_PER_SECOND = float(os.environ.get("TICKS_PER_SECOND", "1.0"))  # 1HZ10V ~ 
 
 # Candidate grid the Monte Carlo engine searches over
 DURATION_CANDIDATES_MIN = [5, 10, 15, 20, 30]
-BARRIER_HALF_WIDTH_PCT = [0.15, 0.25, 0.35, 0.5, 0.75, 1.0]
+
+# NOTE: barrier widths used to be a fixed percent-of-spot grid
+# (0.15%-1.0%). That was miscalibrated for 1HZ10V: realized per-tick
+# vol here runs ~0.0018% (log-return stdev), so a 0.15% half-width is
+# already ~5 standard deviations wide on a 5-min contract -- Deriv
+# quotes those as effectively risk-free and returns
+# ContractBuyValidationError/NoReturn ("This contract offers no
+# return"), and the one candidate that does get a quote clears only a
+# few percent payout, well under MIN_PAYOUT_PCT. Barrier width now
+# scales with the *measured* volatility of the horizon instead of a
+# static percent -- see BARRIER_SIGMA_MULTIPLIERS / search_grid below.
+BARRIER_SIGMA_MULTIPLIERS = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
 
 # Data windows
 PRICE_HISTORY_LEN = int(os.environ.get("PRICE_HISTORY_LEN", "3000"))
@@ -608,13 +619,37 @@ class MonteCarloEngine:
     def search_grid(
         self, s0: float, historical_returns: np.ndarray,
         durations: List[int] = DURATION_CANDIDATES_MIN,
-        barrier_widths: List[float] = BARRIER_HALF_WIDTH_PCT,
+        sigma_multipliers: List[float] = BARRIER_SIGMA_MULTIPLIERS,
     ) -> List[MCCandidate]:
+        """
+        Barrier half-widths are derived per-duration from the instrument's
+        *measured* per-tick volatility (sigma_multiplier * sigma_horizon),
+        not a fixed percent-of-spot grid. A fixed grid doesn't adapt when
+        realized vol is tiny (as on 1HZ10V) or when it spikes -- either way
+        you end up testing barriers that are wildly mis-scaled for the
+        current regime. Scaling by sigma means "0.5" always means
+        "half a standard deviation of this horizon's expected move",
+        regardless of the instrument or the current vol regime, so the
+        grid always spans a genuine mix of "likely to breach" (tight,
+        higher payout) to "likely to stay" (wide, lower payout) instead of
+        drifting entirely into the no-return zone.
+        """
         self.maybe_refit(historical_returns)
+
+        if len(historical_returns) >= 2:
+            sigma_step = float(np.std(historical_returns[-REGIME_LOOKBACK:], ddof=1))
+        else:
+            sigma_step = self._fallback_sigma or 1e-4
+        if not sigma_step or sigma_step <= 0:
+            sigma_step = self._fallback_sigma or 1e-4
+
         results = []
         for d in durations:
-            for w in barrier_widths:
-                results.append(self.estimate_stay_probability(s0, d, w, historical_returns))
+            steps = max(1, int(d * 60 * TICKS_PER_SECOND))
+            sigma_horizon = sigma_step * math.sqrt(steps)  # expected stdev of log-move over this horizon
+            for k in sigma_multipliers:
+                width_pct = k * sigma_horizon * 100.0  # convert to the same "% of spot" units estimate_stay_probability expects
+                results.append(self.estimate_stay_probability(s0, d, width_pct, historical_returns))
         return results
 
 
@@ -977,9 +1012,12 @@ class ExpiryRangeCompressionBot:
     """
 
     # Representative candidate used only for the heartbeat's quick MC read --
-    # not part of the actual trading grid/decision.
+    # not part of the actual trading grid/decision. The barrier width here
+    # is recomputed each heartbeat from measured vol (see _log_heartbeat),
+    # so this is just the sigma multiplier and reference duration, not a
+    # fixed percent -- same fix as the trading grid in search_grid().
     HEARTBEAT_DURATION_MIN = 10
-    HEARTBEAT_BARRIER_HW_PCT = 0.5
+    HEARTBEAT_BARRIER_SIGMA_MULTIPLIER = 1.0
 
     @staticmethod
     def _write_signal_audit(
@@ -1224,15 +1262,18 @@ class ExpiryRangeCompressionBot:
         if self.last_price is not None and n_ticks >= 200:
             returns = self.history.log_returns()
             self.mc_engine.maybe_refit(returns)  # no-op if within REFIT_INTERVAL_SEC
+            sigma_step = float(np.std(returns[-REGIME_LOOKBACK:], ddof=1)) if len(returns) >= REGIME_LOOKBACK else float(np.std(returns, ddof=1))
+            steps = max(1, int(self.HEARTBEAT_DURATION_MIN * 60 * TICKS_PER_SECOND))
+            heartbeat_barrier_hw_pct = self.HEARTBEAT_BARRIER_SIGMA_MULTIPLIER * sigma_step * math.sqrt(steps) * 100.0
             quick = self.mc_engine.estimate_stay_probability(
                 s0=self.last_price,
                 duration_min=self.HEARTBEAT_DURATION_MIN,
-                barrier_half_width_pct=self.HEARTBEAT_BARRIER_HW_PCT,
+                barrier_half_width_pct=heartbeat_barrier_hw_pct,
                 historical_returns=returns,
             )
             log.info(
-                "  MC READ (diagnostic, %smin/%.2f%% barrier) | parametric=%.3f bootstrap=%.3f blended=%.3f",
-                self.HEARTBEAT_DURATION_MIN, self.HEARTBEAT_BARRIER_HW_PCT,
+                "  MC READ (diagnostic, %smin/%.4f%% barrier [%.1fsigma]) | parametric=%.3f bootstrap=%.3f blended=%.3f",
+                self.HEARTBEAT_DURATION_MIN, heartbeat_barrier_hw_pct, self.HEARTBEAT_BARRIER_SIGMA_MULTIPLIER,
                 quick.p_stay_parametric, quick.p_stay_bootstrap, quick.p_stay_blended,
             )
 
