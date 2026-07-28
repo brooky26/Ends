@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt --break-system-packages"]
+
+[start]
+cmd = "python bot.py"
