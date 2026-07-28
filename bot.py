@@ -471,8 +471,7 @@ class MonteCarloEngine:
             self._garch_fitted = None
             return
         try:
-            scaled = returns * 1000.0  # arch expects returns on a larger scale numerically
-            am = arch_model(scaled, vol="Garch", p=1, q=1, dist="normal", mean="Zero")
+            am = arch_model(returns, vol="Garch", p=1, q=1, dist="normal", mean="Zero", rescale=True)
             res = am.fit(disp="off")
             self._garch_fitted = res
         except Exception as exc:
@@ -484,7 +483,8 @@ class MonteCarloEngine:
         if self._garch_fitted is not None:
             try:
                 fc = self._garch_fitted.forecast(horizon=steps, reindex=False)
-                variance = fc.variance.values[-1] / (1000.0 ** 2)
+                scale = getattr(self._garch_fitted, "scale", 1.0) or 1.0
+                variance = fc.variance.values[-1] / (scale ** 2)
                 sigma = np.sqrt(np.clip(variance, 1e-12, None))
                 if len(sigma) < steps:
                     sigma = np.concatenate([sigma, np.full(steps - len(sigma), sigma[-1])])
@@ -883,8 +883,8 @@ async def select_trade(
         try:
             proposal = await deriv.get_proposal(
                 duration_min=c.duration_min,
-                barrier_high=round(barrier_abs, 5),
-                barrier_low=round(barrier_abs, 5),
+                barrier_high=round(barrier_abs, 2),
+                barrier_low=round(barrier_abs, 2),
                 stake=stake,
             )
         except Exception as exc:
