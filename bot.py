@@ -149,13 +149,13 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Trading params -- small stake per explicit choice to go live directly
-STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "0.35"))
+STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "1.0"))
 # Minimum acceptable profit at a reference stake, expressed as a payout %
 # gate: for a $0.35 stake, $0.11 minimum profit -> 0.11/0.35*100 = 31.43%.
 # Flat across durations (not scaled the way barriers are) since it's a
 # straight profit/stake ratio, not a time-dependent quantity.
-MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.20"))
-MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.11"))
+MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.4"))
+MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.6"))
 MIN_PAYOUT_PCT = float(os.environ.get(
     "MIN_PAYOUT_PCT", str(MIN_PAYOUT_REF_PROFIT / MIN_PAYOUT_REF_STAKE * 100.0)
 ))  # gate, not a guarantee
