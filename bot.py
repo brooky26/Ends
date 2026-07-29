@@ -154,7 +154,7 @@ STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "0.35"))
 # gate: for a $0.35 stake, $0.11 minimum profit -> 0.11/0.35*100 = 31.43%.
 # Flat across durations (not scaled the way barriers are) since it's a
 # straight profit/stake ratio, not a time-dependent quantity.
-MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.35"))
+MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.20"))
 MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.11"))
 MIN_PAYOUT_PCT = float(os.environ.get(
     "MIN_PAYOUT_PCT", str(MIN_PAYOUT_REF_PROFIT / MIN_PAYOUT_REF_STAKE * 100.0)
