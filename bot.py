@@ -40,6 +40,7 @@ Environment variables (see .env.example):
 
 import asyncio
 import os
+import gc
 import json
 import time
 import math
@@ -149,12 +150,12 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Trading params -- small stake per explicit choice to go live directly
 STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "1.0"))
-MIN_PAYOUT_PCT = float(os.environ.get("MIN_PAYOUT_PCT", "40.0"))  # gate, not a guarantee
+MIN_PAYOUT_PCT = float(os.environ.get("MIN_PAYOUT_PCT", "52.0"))  # gate, not a guarantee
 MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", "1"))
 COOLDOWN_SEC_AFTER_TRADE = int(os.environ.get("COOLDOWN_SEC_AFTER_TRADE", "30"))
 
 # Monte Carlo params
-MC_PATHS = int(os.environ.get("MC_PATHS", "50000"))
+MC_PATHS = int(os.environ.get("MC_PATHS", "5000"))
 HMM_N_STATES = int(os.environ.get("HMM_N_STATES", "3"))
 JUMP_INTENSITY_PER_DAY = float(os.environ.get("JUMP_INTENSITY_PER_DAY", "2.0"))
 JUMP_MEAN = float(os.environ.get("JUMP_MEAN", "0.0"))
@@ -163,29 +164,7 @@ TICKS_PER_SECOND = float(os.environ.get("TICKS_PER_SECOND", "1.0"))  # 1HZ10V ~ 
 
 # Candidate grid the Monte Carlo engine searches over
 DURATION_CANDIDATES_MIN = [5, 10, 15, 20, 30]
-
-# NOTE: barrier widths used to be a fixed percent-of-spot grid
-# (0.15%-1.0%). That was miscalibrated for 1HZ10V: realized per-tick
-# vol here runs ~0.0018% (log-return stdev), so a 0.15% half-width is
-# already ~5 standard deviations wide on a 5-min contract -- Deriv
-# quotes those as effectively risk-free and returns
-# ContractBuyValidationError/NoReturn ("This contract offers no
-# return"), and the one candidate that does get a quote clears only a
-# few percent payout, well under MIN_PAYOUT_PCT. Barrier width now
-# scales with the *measured* volatility of the horizon instead of a
-# static percent -- see BARRIER_SIGMA_MULTIPLIERS / search_grid below.
-#
-# Widened from the initial [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]: live logs
-# after the first fix showed Deriv's payout curve is steep right
-# around 0.5-1.0 sigma -- payout jumped from ~78% (0.5 sigma, but
-# p_stay too low to clear the EV gate) straight down to 43% then 13%
-# then 3% at the next few coarse steps, skipping over the region
-# where payout and p_stay might both clear their gates at once. Finer
-# steps through that zone (0.6-1.1 sigma) give the gate logic more
-# chances to find a candidate where both actually line up, without
-# changing what "sigma" means or touching the gate thresholds
-# themselves.
-BARRIER_SIGMA_MULTIPLIERS = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0]
+BARRIER_HALF_WIDTH_PCT = [0.15, 0.25, 0.35, 0.5, 0.75, 1.0]
 
 # Data windows
 PRICE_HISTORY_LEN = int(os.environ.get("PRICE_HISTORY_LEN", "3000"))
@@ -524,18 +503,24 @@ class MonteCarloEngine:
           - HMM state transitions (if fitted) selecting per-step mu
           - GARCH-conditional sigma scaling the per-step Gaussian shock
           - Merton jump-diffusion overlay
+
+        Uses float32 throughout (Monte-Carlo precision doesn't need float64)
+        to keep peak memory bounded -- at MC_PATHS=5000 and per-tick
+        resolution, a 30min candidate is (5000, 1800) per array; float64
+        put a dozen such arrays alive at once (~800MB-1GB peak), enough to
+        OOM-kill the container mid-grid on memory-limited hosts like Railway.
         """
         n = self.n_paths
-        garch_sigma = self._garch_sigma_forecast(steps)  # shape (steps,)
+        garch_sigma = self._garch_sigma_forecast(steps).astype(np.float32)  # (steps,)
 
         if self._hmm is not None:
-            means = self._hmm.means_.flatten()
+            means = self._hmm.means_.flatten().astype(np.float32)
             transmat = self._hmm.transmat_
             startprob = self._hmm.startprob_
             state_vars = self._hmm.covars_.reshape(self.hmm_states, -1)[:, 0]
-            state_sigmas = np.sqrt(np.clip(state_vars, 1e-12, None))
+            state_sigmas = np.sqrt(np.clip(state_vars, 1e-12, None)).astype(np.float32)
 
-            states = np.zeros((n, steps), dtype=int)
+            states = np.zeros((n, steps), dtype=np.int8)
             states[:, 0] = np.random.choice(self.hmm_states, size=n, p=startprob)
             for t in range(1, steps):
                 for s in range(self.hmm_states):
@@ -544,37 +529,45 @@ class MonteCarloEngine:
                         states[mask, t] = np.array(
                             [np.random.choice(self.hmm_states, p=transmat[s]) for _ in range(mask.sum())]
                         )
-            mu_path = means[states]                      # (n, steps)
-            regime_sigma_path = state_sigmas[states]      # (n, steps)
+            mu_path = means[states]                      # (n, steps) float32
+            regime_sigma_path = state_sigmas[states]      # (n, steps) float32
+            del states
         else:
             # Fallback: single-regime, mean drift ~ 0 (risk-neutral-ish for a
             # short synthetic-index horizon), sigma purely from GARCH/rolling.
-            mu_path = np.zeros((n, steps))
+            mu_path = np.zeros((n, steps), dtype=np.float32)
             regime_sigma_path = np.tile(garch_sigma, (n, 1))
 
         # Blend regime sigma with GARCH conditional sigma (geometric mean so
         # neither source dominates); this is a simplification -- a fuller
         # implementation would feed regime-conditional residuals into the
         # GARCH recursion directly rather than blending after the fact.
-        sigma_path = np.sqrt(regime_sigma_path * np.tile(garch_sigma, (n, 1)))
+        sigma_path = np.sqrt(regime_sigma_path * np.tile(garch_sigma, (n, 1))).astype(np.float32)
+        del regime_sigma_path
 
-        z = np.random.standard_normal((n, steps))
+        z = np.random.standard_normal((n, steps)).astype(np.float32)
         diffusion = (mu_path - 0.5 * sigma_path ** 2) + sigma_path * z
+        del mu_path, sigma_path, z
 
         # Merton jump overlay
         jump_intensity_per_step = JUMP_INTENSITY_PER_DAY / (24 * 60 * 60) * (60.0 / TICKS_PER_SECOND)
-        jump_counts = np.random.poisson(jump_intensity_per_step, size=(n, steps))
+        jump_counts = np.random.poisson(jump_intensity_per_step, size=(n, steps)).astype(np.int16)
         jump_sizes = np.where(
             jump_counts > 0,
-            np.random.normal(JUMP_MEAN, JUMP_STD, size=(n, steps)) * jump_counts,
+            np.random.normal(JUMP_MEAN, JUMP_STD, size=(n, steps)).astype(np.float32) * jump_counts,
             0.0,
-        )
+        ).astype(np.float32)
+        del jump_counts
 
         log_returns = diffusion + jump_sizes
+        del diffusion, jump_sizes
         log_prices = np.cumsum(log_returns, axis=1)
-        log_prices = np.concatenate([np.zeros((n, 1)), log_prices], axis=1)
+        del log_returns
+        log_prices = np.concatenate([np.zeros((n, 1), dtype=np.float32), log_prices], axis=1)
         prices = s0 * np.exp(log_prices)
+        del log_prices
         return prices
+
 
     def _simulate_bootstrap(self, s0: float, steps: int, historical_returns: np.ndarray,
                              block_size: int = 20) -> np.ndarray:
@@ -582,12 +575,13 @@ class MonteCarloEngine:
         empirical fat tails and short-range autocorrelation better than a
         purely parametric draw)."""
         n = self.n_paths
+        historical_returns = historical_returns.astype(np.float32, copy=False)
         if len(historical_returns) < block_size * 2:
             # not enough history -- fall back to iid resampling
             sampled = np.random.choice(historical_returns, size=(n, steps), replace=True)
         else:
             n_blocks = math.ceil(steps / block_size)
-            sampled = np.zeros((n, n_blocks * block_size))
+            sampled = np.zeros((n, n_blocks * block_size), dtype=np.float32)
             max_start = len(historical_returns) - block_size
             for p in range(n):
                 for b in range(n_blocks):
@@ -595,8 +589,12 @@ class MonteCarloEngine:
                     sampled[p, b * block_size:(b + 1) * block_size] = historical_returns[start:start + block_size]
             sampled = sampled[:, :steps]
         log_prices = np.cumsum(sampled, axis=1)
-        log_prices = np.concatenate([np.zeros((n, 1)), log_prices], axis=1)
-        return s0 * np.exp(log_prices)
+        del sampled
+        log_prices = np.concatenate([np.zeros((n, 1), dtype=np.float32), log_prices], axis=1)
+        prices = s0 * np.exp(log_prices)
+        del log_prices
+        return prices
+
 
     def estimate_stay_probability(
         self,
@@ -630,37 +628,14 @@ class MonteCarloEngine:
     def search_grid(
         self, s0: float, historical_returns: np.ndarray,
         durations: List[int] = DURATION_CANDIDATES_MIN,
-        sigma_multipliers: List[float] = BARRIER_SIGMA_MULTIPLIERS,
+        barrier_widths: List[float] = BARRIER_HALF_WIDTH_PCT,
     ) -> List[MCCandidate]:
-        """
-        Barrier half-widths are derived per-duration from the instrument's
-        *measured* per-tick volatility (sigma_multiplier * sigma_horizon),
-        not a fixed percent-of-spot grid. A fixed grid doesn't adapt when
-        realized vol is tiny (as on 1HZ10V) or when it spikes -- either way
-        you end up testing barriers that are wildly mis-scaled for the
-        current regime. Scaling by sigma means "0.5" always means
-        "half a standard deviation of this horizon's expected move",
-        regardless of the instrument or the current vol regime, so the
-        grid always spans a genuine mix of "likely to breach" (tight,
-        higher payout) to "likely to stay" (wide, lower payout) instead of
-        drifting entirely into the no-return zone.
-        """
         self.maybe_refit(historical_returns)
-
-        if len(historical_returns) >= 2:
-            sigma_step = float(np.std(historical_returns[-REGIME_LOOKBACK:], ddof=1))
-        else:
-            sigma_step = self._fallback_sigma or 1e-4
-        if not sigma_step or sigma_step <= 0:
-            sigma_step = self._fallback_sigma or 1e-4
-
         results = []
         for d in durations:
-            steps = max(1, int(d * 60 * TICKS_PER_SECOND))
-            sigma_horizon = sigma_step * math.sqrt(steps)  # expected stdev of log-move over this horizon
-            for k in sigma_multipliers:
-                width_pct = k * sigma_horizon * 100.0  # convert to the same "% of spot" units estimate_stay_probability expects
-                results.append(self.estimate_stay_probability(s0, d, width_pct, historical_returns))
+            for w in barrier_widths:
+                results.append(self.estimate_stay_probability(s0, d, w, historical_returns))
+                gc.collect()  # free the large per-candidate sim arrays before the next one
         return results
 
 
@@ -1023,12 +998,9 @@ class ExpiryRangeCompressionBot:
     """
 
     # Representative candidate used only for the heartbeat's quick MC read --
-    # not part of the actual trading grid/decision. The barrier width here
-    # is recomputed each heartbeat from measured vol (see _log_heartbeat),
-    # so this is just the sigma multiplier and reference duration, not a
-    # fixed percent -- same fix as the trading grid in search_grid().
+    # not part of the actual trading grid/decision.
     HEARTBEAT_DURATION_MIN = 10
-    HEARTBEAT_BARRIER_SIGMA_MULTIPLIER = 1.0
+    HEARTBEAT_BARRIER_HW_PCT = 0.5
 
     @staticmethod
     def _write_signal_audit(
@@ -1273,18 +1245,15 @@ class ExpiryRangeCompressionBot:
         if self.last_price is not None and n_ticks >= 200:
             returns = self.history.log_returns()
             self.mc_engine.maybe_refit(returns)  # no-op if within REFIT_INTERVAL_SEC
-            sigma_step = float(np.std(returns[-REGIME_LOOKBACK:], ddof=1)) if len(returns) >= REGIME_LOOKBACK else float(np.std(returns, ddof=1))
-            steps = max(1, int(self.HEARTBEAT_DURATION_MIN * 60 * TICKS_PER_SECOND))
-            heartbeat_barrier_hw_pct = self.HEARTBEAT_BARRIER_SIGMA_MULTIPLIER * sigma_step * math.sqrt(steps) * 100.0
             quick = self.mc_engine.estimate_stay_probability(
                 s0=self.last_price,
                 duration_min=self.HEARTBEAT_DURATION_MIN,
-                barrier_half_width_pct=heartbeat_barrier_hw_pct,
+                barrier_half_width_pct=self.HEARTBEAT_BARRIER_HW_PCT,
                 historical_returns=returns,
             )
             log.info(
-                "  MC READ (diagnostic, %smin/%.4f%% barrier [%.1fsigma]) | parametric=%.3f bootstrap=%.3f blended=%.3f",
-                self.HEARTBEAT_DURATION_MIN, heartbeat_barrier_hw_pct, self.HEARTBEAT_BARRIER_SIGMA_MULTIPLIER,
+                "  MC READ (diagnostic, %smin/%.2f%% barrier) | parametric=%.3f bootstrap=%.3f blended=%.3f",
+                self.HEARTBEAT_DURATION_MIN, self.HEARTBEAT_BARRIER_HW_PCT,
                 quick.p_stay_parametric, quick.p_stay_bootstrap, quick.p_stay_blended,
             )
 
