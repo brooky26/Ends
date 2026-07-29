@@ -149,8 +149,16 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Trading params -- small stake per explicit choice to go live directly
-STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "1.0"))
-MIN_PAYOUT_PCT = float(os.environ.get("MIN_PAYOUT_PCT", "52.0"))  # gate, not a guarantee
+STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "0.35"))
+# Minimum acceptable profit at a reference stake, expressed as a payout %
+# gate: for a $0.35 stake, $0.11 minimum profit -> 0.11/0.35*100 = 31.43%.
+# Flat across durations (not scaled the way barriers are) since it's a
+# straight profit/stake ratio, not a time-dependent quantity.
+MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.35"))
+MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.11"))
+MIN_PAYOUT_PCT = float(os.environ.get(
+    "MIN_PAYOUT_PCT", str(MIN_PAYOUT_REF_PROFIT / MIN_PAYOUT_REF_STAKE * 100.0)
+))  # gate, not a guarantee
 MAX_CONCURRENT_TRADES = int(os.environ.get("MAX_CONCURRENT_TRADES", "1"))
 COOLDOWN_SEC_AFTER_TRADE = int(os.environ.get("COOLDOWN_SEC_AFTER_TRADE", "30"))
 
@@ -162,9 +170,31 @@ JUMP_MEAN = float(os.environ.get("JUMP_MEAN", "0.0"))
 JUMP_STD = float(os.environ.get("JUMP_STD", "0.004"))
 TICKS_PER_SECOND = float(os.environ.get("TICKS_PER_SECOND", "1.0"))  # 1HZ10V ~ 1 tick/sec
 
-# Candidate grid the Monte Carlo engine searches over
-DURATION_CANDIDATES_MIN = [5, 10, 15, 20, 30]
-BARRIER_HALF_WIDTH_PCT = [0.15, 0.25, 0.35, 0.5, 0.75, 1.0]
+# Candidate grid the Monte Carlo engine searches over.
+# Barriers are specified in absolute price units (not % of spot) -- this
+# matters a lot for this instrument: realized_vol is tiny (~0.000018/tick),
+# so a barrier expressed as a % of a ~9400 spot was enormous relative to
+# actual volatility (0.15% == ~14 price units, vs. an expected 2min stdev
+# of only ~1.85), which is why almost every candidate came back Deriv
+# NoReturn -- staying inside was a near-certainty, so there's no payout.
+#
+# BARRIER_ABS_LOW/HIGH_AT_REF give the barrier band (in price units) at
+# BARRIER_REF_DURATION_MIN; other durations scale by sqrt(duration/ref),
+# matching how a random walk's stdev grows with time.
+DURATION_CANDIDATES_MIN = [2, 5, 10, 15, 20, 30]
+BARRIER_REF_DURATION_MIN = float(os.environ.get("BARRIER_REF_DURATION_MIN", "2"))
+BARRIER_ABS_LOW_AT_REF = float(os.environ.get("BARRIER_ABS_LOW_AT_REF", "1.69"))
+BARRIER_ABS_HIGH_AT_REF = float(os.environ.get("BARRIER_ABS_HIGH_AT_REF", "2.3"))
+BARRIER_GRID_POINTS = int(os.environ.get("BARRIER_GRID_POINTS", "6"))
+
+
+def barrier_abs_grid_for_duration(duration_min: float) -> List[float]:
+    """Absolute-price-unit barrier half-widths for a given duration, scaled
+    from the BARRIER_ABS_LOW/HIGH_AT_REF band via sqrt(time)."""
+    scale = math.sqrt(duration_min / BARRIER_REF_DURATION_MIN)
+    low = BARRIER_ABS_LOW_AT_REF * scale
+    high = BARRIER_ABS_HIGH_AT_REF * scale
+    return [round(x, 4) for x in np.linspace(low, high, BARRIER_GRID_POINTS)]
 
 # Data windows
 PRICE_HISTORY_LEN = int(os.environ.get("PRICE_HISTORY_LEN", "3000"))
@@ -350,7 +380,7 @@ class RegimeDetector:
 @dataclass
 class MCCandidate:
     duration_min: int
-    barrier_half_width_pct: float
+    barrier_abs: float
     p_stay_parametric: float
     p_stay_bootstrap: float
     p_stay_blended: float
@@ -600,12 +630,12 @@ class MonteCarloEngine:
         self,
         s0: float,
         duration_min: int,
-        barrier_half_width_pct: float,
+        barrier_abs: float,
         historical_returns: np.ndarray,
     ) -> MCCandidate:
         steps = max(1, int(duration_min * 60 * TICKS_PER_SECOND))
-        upper = s0 * (1 + barrier_half_width_pct / 100.0)
-        lower = s0 * (1 - barrier_half_width_pct / 100.0)
+        upper = s0 + barrier_abs
+        lower = s0 - barrier_abs
 
         parametric_prices = self._simulate_regime_switching_gbm(s0, steps)
         stayed_parametric = np.all((parametric_prices >= lower) & (parametric_prices <= upper), axis=1)
@@ -619,7 +649,7 @@ class MonteCarloEngine:
 
         return MCCandidate(
             duration_min=duration_min,
-            barrier_half_width_pct=barrier_half_width_pct,
+            barrier_abs=barrier_abs,
             p_stay_parametric=p_stay_parametric,
             p_stay_bootstrap=p_stay_bootstrap,
             p_stay_blended=p_stay_blended,
@@ -628,13 +658,12 @@ class MonteCarloEngine:
     def search_grid(
         self, s0: float, historical_returns: np.ndarray,
         durations: List[int] = DURATION_CANDIDATES_MIN,
-        barrier_widths: List[float] = BARRIER_HALF_WIDTH_PCT,
     ) -> List[MCCandidate]:
         self.maybe_refit(historical_returns)
         results = []
         for d in durations:
-            for w in barrier_widths:
-                results.append(self.estimate_stay_probability(s0, d, w, historical_returns))
+            for barrier_abs in barrier_abs_grid_for_duration(d):
+                results.append(self.estimate_stay_probability(s0, d, barrier_abs, historical_returns))
                 gc.collect()  # free the large per-candidate sim arrays before the next one
         return results
 
@@ -861,7 +890,7 @@ class SupabaseLogger:
 class TradeDecision:
     should_trade: bool
     duration_min: Optional[int] = None
-    barrier_half_width_pct: Optional[float] = None
+    barrier_abs: Optional[float] = None
     payout_pct: Optional[float] = None
     p_stay: Optional[float] = None
     ev: Optional[float] = None
@@ -895,12 +924,12 @@ async def select_trade(
     for c in candidates:
         entry: Dict[str, Any] = {
             "duration_min": c.duration_min,
-            "barrier_half_width_pct": c.barrier_half_width_pct,
+            "barrier_abs": c.barrier_abs,
             "p_stay_parametric": c.p_stay_parametric,
             "p_stay_bootstrap": c.p_stay_bootstrap,
             "p_stay_blended": c.p_stay_blended,
         }
-        barrier_abs = spot * (c.barrier_half_width_pct / 100.0)
+        barrier_abs = c.barrier_abs
         try:
             proposal = await deriv.get_proposal(
                 duration_min=c.duration_min,
@@ -909,7 +938,7 @@ async def select_trade(
                 stake=stake,
             )
         except Exception as exc:
-            log.warning("Proposal request failed for %s/%s: %s", c.duration_min, c.barrier_half_width_pct, exc)
+            log.warning("Proposal request failed for %s/%s: %s", c.duration_min, c.barrier_abs, exc)
             entry.update({"gate": "proposal_failed", "detail": str(exc)})
             diagnostics.append(entry)
             continue
@@ -958,7 +987,7 @@ async def select_trade(
     return TradeDecision(
         should_trade=True,
         duration_min=best.duration_min,
-        barrier_half_width_pct=best.barrier_half_width_pct,
+        barrier_abs=best.barrier_abs,
         payout_pct=payout_pct,
         p_stay=best.p_stay_blended,
         ev=ev,
@@ -1000,7 +1029,6 @@ class ExpiryRangeCompressionBot:
     # Representative candidate used only for the heartbeat's quick MC read --
     # not part of the actual trading grid/decision.
     HEARTBEAT_DURATION_MIN = 10
-    HEARTBEAT_BARRIER_HW_PCT = 0.5
 
     @staticmethod
     def _write_signal_audit(
@@ -1038,14 +1066,14 @@ class ExpiryRangeCompressionBot:
         ]
         for c in candidates:
             lines.append(
-                f"    duration={c.duration_min:>2}min  barrier_hw={c.barrier_half_width_pct:>4.2f}%  "
+                f"    duration={c.duration_min:>2}min  barrier=±{c.barrier_abs:>6.3f}  "
                 f"p_stay: parametric={c.p_stay_parametric:.3f}  bootstrap={c.p_stay_bootstrap:.3f}  "
                 f"blended={c.p_stay_blended:.3f}"
             )
         lines.append("[3] GATE LAYER (payout gate + EV gate, per candidate)")
         for d in decision.diagnostics:
             gate = d.get("gate", "unknown")
-            base = f"    duration={d['duration_min']:>2}min barrier_hw={d['barrier_half_width_pct']:>4.2f}%  -> {gate}"
+            base = f"    duration={d['duration_min']:>2}min barrier=±{d['barrier_abs']:>6.3f}  -> {gate}"
             if gate == "passed":
                 base += (f"  payout_pct={d.get('payout_pct', float('nan')):.2f}%  "
                          f"breakeven_p={d.get('breakeven_p', float('nan')):.3f}  ev={d.get('ev', float('nan')):.4f}")
@@ -1056,7 +1084,7 @@ class ExpiryRangeCompressionBot:
         if decision.should_trade:
             lines.append(
                 f"    TRADE TAKEN  duration={decision.duration_min}min  "
-                f"barrier_hw={decision.barrier_half_width_pct}%  payout={decision.payout_pct:.2f}%  "
+                f"barrier=±{decision.barrier_abs:.3f}  payout={decision.payout_pct:.2f}%  "
                 f"p_stay={decision.p_stay:.3f}  ev={decision.ev:.4f}"
             )
         else:
@@ -1174,7 +1202,7 @@ class ExpiryRangeCompressionBot:
             base_log_row.update({
                 "gate_passed": True,
                 "duration_min": decision.duration_min,
-                "barrier_half_width_pct": decision.barrier_half_width_pct,
+                "barrier_abs": decision.barrier_abs,
                 "payout_pct": decision.payout_pct,
                 "p_stay_model": decision.p_stay,
                 "ev": decision.ev,
@@ -1184,8 +1212,8 @@ class ExpiryRangeCompressionBot:
             })
             self.logger.log_trade(base_log_row)
             log.info(
-                "TRADE PLACED: duration=%smin barrier_hw=%.2f%% payout=%.1f%% p_stay=%.3f ev=%.4f",
-                decision.duration_min, decision.barrier_half_width_pct,
+                "TRADE PLACED: duration=%smin barrier=±%.3f payout=%.1f%% p_stay=%.3f ev=%.4f",
+                decision.duration_min, decision.barrier_abs,
                 decision.payout_pct, decision.p_stay, decision.ev,
             )
             trade_log.info(
@@ -1245,15 +1273,18 @@ class ExpiryRangeCompressionBot:
         if self.last_price is not None and n_ticks >= 200:
             returns = self.history.log_returns()
             self.mc_engine.maybe_refit(returns)  # no-op if within REFIT_INTERVAL_SEC
+            heartbeat_barrier_abs = barrier_abs_grid_for_duration(self.HEARTBEAT_DURATION_MIN)[
+                BARRIER_GRID_POINTS // 2
+            ]
             quick = self.mc_engine.estimate_stay_probability(
                 s0=self.last_price,
                 duration_min=self.HEARTBEAT_DURATION_MIN,
-                barrier_half_width_pct=self.HEARTBEAT_BARRIER_HW_PCT,
+                barrier_abs=heartbeat_barrier_abs,
                 historical_returns=returns,
             )
             log.info(
-                "  MC READ (diagnostic, %smin/%.2f%% barrier) | parametric=%.3f bootstrap=%.3f blended=%.3f",
-                self.HEARTBEAT_DURATION_MIN, self.HEARTBEAT_BARRIER_HW_PCT,
+                "  MC READ (diagnostic, %smin/±%.3f barrier) | parametric=%.3f bootstrap=%.3f blended=%.3f",
+                self.HEARTBEAT_DURATION_MIN, heartbeat_barrier_abs,
                 quick.p_stay_parametric, quick.p_stay_bootstrap, quick.p_stay_blended,
             )
 
@@ -1261,16 +1292,16 @@ class ExpiryRangeCompressionBot:
         if self.last_candidates:
             for c in self.last_candidates:
                 log.info(
-                    "  LAST GRID | duration=%smin barrier_hw=%.2f%% p_stay(parametric=%.3f bootstrap=%.3f blended=%.3f)",
-                    c.duration_min, c.barrier_half_width_pct,
+                    "  LAST GRID | duration=%smin barrier=±%.3f p_stay(parametric=%.3f bootstrap=%.3f blended=%.3f)",
+                    c.duration_min, c.barrier_abs,
                     c.p_stay_parametric, c.p_stay_bootstrap, c.p_stay_blended,
                 )
         if self.last_decision is not None:
             d = self.last_decision
             if d.should_trade:
                 log.info(
-                    "  LAST GATE RESULT | TRADED duration=%smin barrier_hw=%.2f%% payout=%.1f%% p_stay=%.3f ev=%.4f",
-                    d.duration_min, d.barrier_half_width_pct, d.payout_pct, d.p_stay, d.ev,
+                    "  LAST GATE RESULT | TRADED duration=%smin barrier=±%.3f payout=%.1f%% p_stay=%.3f ev=%.4f",
+                    d.duration_min, d.barrier_abs, d.payout_pct, d.p_stay, d.ev,
                 )
             else:
                 log.info("  LAST GATE RESULT | no trade -- %s", d.reason)
