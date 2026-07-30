@@ -149,13 +149,20 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 # Trading params -- small stake per explicit choice to go live directly
-STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "1.0"))
+STAKE_AMOUNT = float(os.environ.get("STAKE_AMOUNT", "0.35"))
+
+# Martingale ladder: 3 stake levels (base, base*factor, base*factor^2).
+# After a loss, escalate one level for the next trade; after a win, or
+# after a loss at the final level, reset back to the base stake. This
+# caps the ladder at 3 rungs rather than escalating indefinitely.
+MARTINGALE_STEPS = int(os.environ.get("MARTINGALE_STEPS", "3"))
+MARTINGALE_FACTOR = float(os.environ.get("MARTINGALE_FACTOR", "1.24"))
 # Minimum acceptable profit at a reference stake, expressed as a payout %
 # gate: for a $0.35 stake, $0.11 minimum profit -> 0.11/0.35*100 = 31.43%.
 # Flat across durations (not scaled the way barriers are) since it's a
 # straight profit/stake ratio, not a time-dependent quantity.
-MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.4"))
-MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.6"))
+MIN_PAYOUT_REF_STAKE = float(os.environ.get("MIN_PAYOUT_REF_STAKE", "0.35"))
+MIN_PAYOUT_REF_PROFIT = float(os.environ.get("MIN_PAYOUT_REF_PROFIT", "0.11"))
 MIN_PAYOUT_PCT = float(os.environ.get(
     "MIN_PAYOUT_PCT", str(MIN_PAYOUT_REF_PROFIT / MIN_PAYOUT_REF_STAKE * 100.0)
 ))  # gate, not a guarantee
@@ -637,12 +644,22 @@ class MonteCarloEngine:
         upper = s0 + barrier_abs
         lower = s0 - barrier_abs
 
+        # NOTE: we trade contract_type="EXPIRYRANGE" ("Ends Between"), which
+        # Deriv settles purely on where price is AT EXPIRY -- not a no-touch
+        # "Stays Between" (contract_type="RANGE") contract. So the win
+        # condition is "did the path END inside [lower, upper]", not "did it
+        # stay inside for every step". Checking the whole path here would
+        # silently compute a much lower, wrong probability (a no-touch
+        # condition is strictly harder to satisfy than an endpoint check),
+        # which would make the EV gate reject good trades for the wrong
+        # reason. If you ever switch to contract_type="RANGE", swap these
+        # back to np.all(...) across the full path.
         parametric_prices = self._simulate_regime_switching_gbm(s0, steps)
-        stayed_parametric = np.all((parametric_prices >= lower) & (parametric_prices <= upper), axis=1)
+        stayed_parametric = (parametric_prices[:, -1] >= lower) & (parametric_prices[:, -1] <= upper)
         p_stay_parametric = float(stayed_parametric.mean())
 
         bootstrap_prices = self._simulate_bootstrap(s0, steps, historical_returns)
-        stayed_bootstrap = np.all((bootstrap_prices >= lower) & (bootstrap_prices <= upper), axis=1)
+        stayed_bootstrap = (bootstrap_prices[:, -1] >= lower) & (bootstrap_prices[:, -1] <= upper)
         p_stay_bootstrap = float(stayed_bootstrap.mean())
 
         p_stay_blended = 0.5 * p_stay_parametric + 0.5 * p_stay_bootstrap
@@ -714,6 +731,9 @@ class DerivClient:
         self.trade_ws = None
         self._req_id = 0
         self._http = None  # aiohttp session, created lazily
+        self._trade_ws_lock = asyncio.Lock()  # serialize send/recv on trade_ws --
+        # needed once more than one coroutine can talk to it (settlement
+        # polling running alongside the main proposal/buy flow)
 
     async def _get_http(self):
         if aiohttp is None:
@@ -788,17 +808,18 @@ class DerivClient:
             await self._connect_trade_ws()
 
     async def _send_trade(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        await self._ensure_trade_ws()
-        self._req_id += 1
-        payload = {**payload, "req_id": self._req_id}
-        await self.trade_ws.send(json.dumps(payload))
-        while True:
-            raw = await self.trade_ws.recv()
-            msg = json.loads(raw)
-            if msg.get("req_id") == self._req_id:
-                if "error" in msg:
-                    raise RuntimeError(f"Deriv API error: {msg['error']}")
-                return msg
+        async with self._trade_ws_lock:
+            await self._ensure_trade_ws()
+            self._req_id += 1
+            payload = {**payload, "req_id": self._req_id}
+            await self.trade_ws.send(json.dumps(payload))
+            while True:
+                raw = await self.trade_ws.recv()
+                msg = json.loads(raw)
+                if msg.get("req_id") == self._req_id:
+                    if "error" in msg:
+                        raise RuntimeError(f"Deriv API error: {msg['error']}")
+                    return msg
 
     # -- market data -----------------------------------------------------------
 
@@ -842,6 +863,16 @@ class DerivClient:
 
     async def buy(self, proposal_id: str, price: float) -> Dict[str, Any]:
         return await self._send_trade({"buy": proposal_id, "price": price})
+
+    async def get_balance(self) -> float:
+        """Current account balance in account currency (USD here)."""
+        msg = await self._send_trade({"balance": 1})
+        return float(msg["balance"]["balance"])
+
+    async def get_contract_status(self, contract_id: str) -> Dict[str, Any]:
+        """One-shot read of a contract's current state (not a subscription).
+        Poll this until is_sold=1 to know when/how a trade settled."""
+        return await self._send_trade({"proposal_open_contract": 1, "contract_id": contract_id})
 
     async def close(self) -> None:
         if self.public_ws is not None:
@@ -1100,6 +1131,7 @@ class ExpiryRangeCompressionBot:
         self.logger = SupabaseLogger()
         self.open_trades = 0
         self._last_trade_time = 0.0
+        self.consecutive_losses = 0  # martingale ladder position (0..MARTINGALE_STEPS-1)
 
         # state surfaced by the heartbeat logger
         self.last_regime: Optional[RegimeReading] = None
@@ -1111,7 +1143,53 @@ class ExpiryRangeCompressionBot:
         self.miss_count = 0
         self.compression_count = 0
 
-    async def run(self) -> None:
+    def _current_stake(self) -> float:
+        """Base stake, escalated by MARTINGALE_FACTOR per consecutive loss,
+        capped at MARTINGALE_STEPS rungs. Rounded to cents since Deriv
+        expects a plain 2-decimal USD amount."""
+        rung = min(self.consecutive_losses, MARTINGALE_STEPS - 1)
+        return round(STAKE_AMOUNT * (MARTINGALE_FACTOR ** rung), 2)
+
+    async def _monitor_settlement(self, contract_id: str, stake_used: float) -> None:
+        """Poll a bought contract until it settles, then update the
+        martingale ladder and free up the concurrent-trade slot. Runs as a
+        background task so it doesn't block the main tick loop."""
+        poll_interval_sec = 10
+        max_polls = 3 * 60 * 60 // poll_interval_sec  # generous safety cap (~3h)
+        try:
+            for _ in range(max_polls):
+                await asyncio.sleep(poll_interval_sec)
+                try:
+                    status = await self.deriv.get_contract_status(contract_id)
+                except Exception as exc:
+                    log.warning("Contract status check failed for %s: %s", contract_id, exc)
+                    continue
+                poc = status.get("proposal_open_contract", {})
+                if poc.get("is_sold"):
+                    profit = poc.get("profit")
+                    won = (profit is not None and profit > 0)
+                    if won:
+                        self.consecutive_losses = 0
+                    else:
+                        if self.consecutive_losses >= MARTINGALE_STEPS - 1:
+                            self.consecutive_losses = 0  # ladder maxed out -- reset for next round
+                        else:
+                            self.consecutive_losses += 1
+                    log.info(
+                        "SETTLED contract_id=%s stake=%.2f profit=%s outcome=%s next_stake=%.2f",
+                        contract_id, stake_used, profit, "WON" if won else "LOST", self._current_stake(),
+                    )
+                    return
+            log.warning(
+                "Contract %s did not report settled within the polling window -- "
+                "releasing the trade slot anyway as a safety fallback (martingale "
+                "ladder left unchanged since the real outcome is unknown)",
+                contract_id,
+            )
+        finally:
+            self.open_trades = max(0, self.open_trades - 1)
+
+
         await self.deriv.connect()
         log.info("Connected to Deriv. Streaming %s ticks...", SYMBOL)
 
@@ -1154,7 +1232,8 @@ class ExpiryRangeCompressionBot:
             candidates = self.mc_engine.search_grid(s0=price, historical_returns=returns)
             self.last_candidates = candidates
 
-            decision = await select_trade(self.deriv, candidates, spot=price)
+            current_stake = self._current_stake()
+            decision = await select_trade(self.deriv, candidates, spot=price, stake=current_stake)
             self.last_decision = decision
 
             # Full intelligence-layer audit (regime + every MC candidate +
@@ -1182,6 +1261,26 @@ class ExpiryRangeCompressionBot:
                 continue
 
             try:
+                balance = await self.deriv.get_balance()
+            except Exception as exc:
+                log.exception("Balance check failed, skipping trade to be safe: %s", exc)
+                base_log_row.update({"gate_passed": True, "reason": f"balance_check_failed: {exc}"})
+                self.logger.log_trade(base_log_row)
+                continue
+
+            if balance < decision.ask_price:
+                log.warning(
+                    "Insufficient balance for this trade: balance=%.2f < ask_price=%.2f -- skipping",
+                    balance, decision.ask_price,
+                )
+                base_log_row.update({
+                    "gate_passed": True,
+                    "reason": f"insufficient_balance: balance {balance:.2f} < ask_price {decision.ask_price:.2f}",
+                })
+                self.logger.log_trade(base_log_row)
+                continue
+
+            try:
                 buy_result = await self.deriv.buy(decision.proposal_id, decision.ask_price)
             except Exception as exc:
                 log.exception("Buy failed: %s", exc)
@@ -1193,11 +1292,14 @@ class ExpiryRangeCompressionBot:
             self.open_trades += 1
             self.trade_count += 1
             self._last_trade_time = time.time()
-            # NOTE: this bot does not currently track contract expiry to
-            # decrement open_trades / free up the cooldown slot -- wire up
-            # a proposal_open_contract subscription on buy_result's
-            # contract_id if you want the loop to reset automatically
-            # rather than relying on MAX_CONCURRENT_TRADES=1 + cooldown.
+            contract_id = buy_result.get("buy", {}).get("contract_id")
+            if contract_id:
+                asyncio.create_task(self._monitor_settlement(contract_id, current_stake))
+            else:
+                # Shouldn't happen if buy() succeeded, but don't leave the
+                # slot permanently stuck if Deriv ever returns no contract_id.
+                log.warning("buy() succeeded but no contract_id returned -- releasing trade slot immediately")
+                self.open_trades = max(0, self.open_trades - 1)
 
             base_log_row.update({
                 "gate_passed": True,
