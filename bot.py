@@ -1189,7 +1189,7 @@ class ExpiryRangeCompressionBot:
         finally:
             self.open_trades = max(0, self.open_trades - 1)
 
-
+    async def run(self) -> None:
         await self.deriv.connect()
         log.info("Connected to Deriv. Streaming %s ticks...", SYMBOL)
 
